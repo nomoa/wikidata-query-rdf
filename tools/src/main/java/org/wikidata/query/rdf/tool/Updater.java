@@ -20,6 +20,8 @@ import java.util.concurrent.Future;
 import org.openrdf.model.Statement;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.wikidata.query.rdf.common.TimerCounter;
+import org.wikidata.query.rdf.common.TimerCounter.Context;
 import org.wikidata.query.rdf.common.uri.UrisScheme;
 import org.wikidata.query.rdf.tool.change.Change;
 import org.wikidata.query.rdf.tool.exception.ContainedException;
@@ -31,7 +33,6 @@ import org.wikidata.query.rdf.tool.wikibase.WikibaseRepository;
 import com.codahale.metrics.Counter;
 import com.codahale.metrics.Meter;
 import com.codahale.metrics.MetricRegistry;
-import com.codahale.metrics.Timer;
 import com.google.common.collect.ImmutableSetMultimap;
 
 /**
@@ -99,9 +100,9 @@ public class Updater<B extends Change.Batch> implements Runnable, Closeable {
      * affected by replication lag.
      */
     private final DeferredChanges deferredChanges = new DeferredChanges();
-    private final Timer wikibaseDataFetchTime;
-    private final Timer rdfRepositoryImportTime;
-    private final Timer rdfRepositoryFetchTime;
+    private final TimerCounter wikibaseDataFetchTime;
+    private final TimerCounter rdfRepositoryImportTime;
+    private final TimerCounter rdfRepositoryFetchTime;
     private final Counter importedChanged;
     private final Counter noopedChangesByRevisionCheck;
     private final Counter importedTriples;
@@ -133,9 +134,9 @@ public class Updater<B extends Change.Batch> implements Runnable, Closeable {
         this.updatesMeter = metricRegistry.meter("updates");
         this.batchAdvanced = metricRegistry.meter("batch-progress");
         this.skipAheadMeter = metricRegistry.meter("updates-skip");
-        this.wikibaseDataFetchTime = metricRegistry.timer("wikibase-data-fetch-time");
-        this.rdfRepositoryImportTime = metricRegistry.timer("rdf-repository-import-time");
-        this.rdfRepositoryFetchTime = metricRegistry.timer("rdf-repository-fetch-time");
+        this.wikibaseDataFetchTime = TimerCounter.counter(metricRegistry.counter("wikibase-data-fetch-time-cnt"));
+        this.rdfRepositoryImportTime = TimerCounter.counter(metricRegistry.counter("rdf-repository-import-time-cnt"));
+        this.rdfRepositoryFetchTime = TimerCounter.counter(metricRegistry.counter("rdf-repository-fetch-time-cnt"));
         this.noopedChangesByRevisionCheck = metricRegistry.counter("noop-by-revision-check");
         this.importedChanged = metricRegistry.counter("rdf-repository-imported-changes");
         this.importedTriples = metricRegistry.counter("rdf-repository-imported-triples");
@@ -206,13 +207,13 @@ public class Updater<B extends Change.Batch> implements Runnable, Closeable {
      */
     protected void handleChanges(Collection<Change> changes) throws InterruptedException {
         Set<Change> trueChanges;
-        try (Timer.Context ctx = rdfRepositoryFetchTime.time()) {
+        try (Context ctx = rdfRepositoryFetchTime.time()) {
             trueChanges = getRevisionUpdates(changes);
         }
         noopedChangesByRevisionCheck.inc(changes.size() - trueChanges.size());
 
         List<Change> processedChanges;
-        try (Timer.Context ctx = wikibaseDataFetchTime.time()) {
+        try (Context ctx = wikibaseDataFetchTime.time()) {
             List<Future<Change>> futureChanges = new ArrayList<>();
             for (Change change : trueChanges) {
                 futureChanges.add(executor.submit(() -> {
@@ -241,10 +242,10 @@ public class Updater<B extends Change.Batch> implements Runnable, Closeable {
         }
 
         int nbTriples;
-        try (Timer.Context ctx = rdfRepositoryImportTime.time()) {
+        try (Context ctx = rdfRepositoryImportTime.time()) {
             nbTriples = rdfRepository.syncFromChanges(processedChanges, verify);
-            updatesMeter.mark(processedChanges.size());
         }
+        updatesMeter.mark(processedChanges.size());
         importedChanged.inc(processedChanges.size());
         importedTriples.inc(nbTriples);
     }
