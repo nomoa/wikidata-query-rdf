@@ -49,11 +49,12 @@ public class AbstractUpdaterIntegrationTestBase {
     @SuppressWarnings("checkstyle:IllegalCatch")
     public void update(int from, int to) {
         ExecutorService executorService = new ThreadPoolExecutor(0, 10, 0, TimeUnit.SECONDS, new LinkedBlockingQueue<>());
+        ExecutorService importerExecutor = new ThreadPoolExecutor(1, 1, 0, TimeUnit.SECONDS, new LinkedBlockingQueue<>(5));
         UrisScheme uris = UrisSchemeFactory.forHost("www.wikidata.org");
         try (
             Change.Source<?> source = IdRangeChangeSource.forItems(from, to, 30);
             Updater<?> updater = new Updater<>(
-                    source, wikibaseRepository.get(), rdfRepository, munger, executorService, 0,
+                    source, wikibaseRepository.get(), rdfRepository, munger, executorService, importerExecutor, 0,
                     uris, false, new MetricRegistry())
         ) {
             updater.run();

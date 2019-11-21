@@ -16,6 +16,7 @@ import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import org.openrdf.model.Statement;
 import org.slf4j.Logger;
@@ -34,6 +35,7 @@ import com.codahale.metrics.Counter;
 import com.codahale.metrics.Meter;
 import com.codahale.metrics.MetricRegistry;
 import com.google.common.collect.ImmutableSetMultimap;
+import com.google.common.collect.Multimap;
 
 /**
  * Update tool.
@@ -84,6 +86,7 @@ public class Updater<B extends Change.Batch> implements Runnable, Closeable {
      * The executor to use for updates.
      */
     private final ExecutorService executor;
+    private ExecutorService importerExecutor;
     /**
      * Seconds to wait after we hit an empty batch. Empty batches signify that
      * there aren't any changes left now but the change stream isn't over. In
@@ -108,26 +111,24 @@ public class Updater<B extends Change.Batch> implements Runnable, Closeable {
     private final Counter importedTriples;
 
     /**
-     * Map entity->values list from repository.
-     */
-    private ImmutableSetMultimap<String, String> repoValues;
-    /**
-     * Map entity->references list from repository.
-     */
-    private ImmutableSetMultimap<String, String> repoRefs;
-    /**
      * Should we verify updates?
      */
     private final boolean verify;
 
+    /**
+     * Last known instant we updated the repository.
+     */
+    private Instant lastRepoDate;
+
     Updater(Change.Source<B> changeSource, WikibaseRepository wikibase, RdfRepository rdfRepository,
-            Munger munger, ExecutorService executor, int pollDelay, UrisScheme uris, boolean verify,
+            Munger munger, ExecutorService executor, ExecutorService importerExecutor, int pollDelay, UrisScheme uris, boolean verify,
             MetricRegistry metricRegistry) {
         this.changeSource = changeSource;
         this.wikibase = wikibase;
         this.rdfRepository = rdfRepository;
         this.munger = munger;
         this.executor = executor;
+        this.importerExecutor = importerExecutor;
         this.pollDelay = pollDelay;
         this.uris = uris;
         this.verify = verify;
@@ -153,32 +154,35 @@ public class Updater<B extends Change.Batch> implements Runnable, Closeable {
             }
         } while (batch == null);
         log.debug("{} changes in batch", batch.changes().size());
-        Instant oldDate = null;
         while (!currentThread().isInterrupted()) {
             try {
-                handleChanges(this.deferredChanges.augmentWithDeferredChanges(batch.changes()));
-                Instant leftOffDate = batch.leftOffDate();
-                if (leftOffDate != null) {
-                    /*
-                     * Back one second because the resolution on our poll isn't
-                     * super good and because its not big deal to recheck if we
-                     * have some updates.
-                     */
-                    leftOffDate = leftOffDate.minusSeconds(1);
-                    // Do not update repo with the same date
-                    if (oldDate == null || !oldDate.equals(leftOffDate)) {
-                        syncDate(leftOffDate);
-                        oldDate = leftOffDate;
-                    }
-                }
-                // TODO wrap all retry-able exceptions in a special exception
-                batchAdvanced.mark(batch.advanced());
-                log.info("Polled up to {} at {} updates per second and {} {} per second", batch.leftOffHuman(),
-                        meterReport(updatesMeter), meterReport(batchAdvanced), batch.advancedUnits());
+                B thisBatch = batch;
+                handleChanges(this.deferredChanges.augmentWithDeferredChanges(batch.changes()),
+                        () -> {
+                            // XXX: We might run this completely out of order
+                            Instant leftOffDate = thisBatch.leftOffDate();
+                            if (leftOffDate != null) {
+                                /*
+                                 * Back one second because the resolution on our poll isn't
+                                 * super good and because its not big deal to recheck if we
+                                 * have some updates.
+                                 */
+                                syncDate(leftOffDate.minusSeconds(1));
+                            }
+                            // TODO wrap all retry-able exceptions in a special exception
+                            batchAdvanced.mark(thisBatch.advanced());
+                            log.info("Polled up to {} at {} updates per second and {} {} per second", thisBatch.leftOffHuman(),
+                                    meterReport(updatesMeter), meterReport(batchAdvanced), thisBatch.advancedUnits());
+                            if (thisBatch.last()) {
+                                return;
+                            }
+                            wikibase.batchDone();
+                        });
                 if (batch.last()) {
+                    importerExecutor.shutdown();
+                    importerExecutor.awaitTermination(5, TimeUnit.MINUTES);
                     return;
                 }
-                wikibase.batchDone();
                 batch = nextBatch(batch);
             } catch (InterruptedException e) {
                 currentThread().interrupt();
@@ -189,8 +193,11 @@ public class Updater<B extends Change.Batch> implements Runnable, Closeable {
     /**
      * Record that we reached certain date in permanent storage.
      */
-    protected void syncDate(Instant newDate) {
-        rdfRepository.updateLeftOffTime(newDate);
+    protected synchronized void syncDate(Instant newDate) {
+        if (newDate.isAfter(lastRepoDate)) {
+            rdfRepository.updateLeftOffTime(newDate);
+            lastRepoDate = newDate;
+        }
     }
 
     @Override
@@ -205,21 +212,21 @@ public class Updater<B extends Change.Batch> implements Runnable, Closeable {
      * @throws InterruptedException if the process is interrupted while waiting
      *             on changes to sync
      */
-    protected void handleChanges(Collection<Change> changes) throws InterruptedException {
-        Set<Change> trueChanges;
+    protected void handleChanges(Collection<Change> changes, Runnable onCompleteListener) throws InterruptedException {
+        ChangesWithValuesAndRefs trueChanges;
         try (Context ctx = rdfRepositoryFetchTime.time()) {
             trueChanges = getRevisionUpdates(changes);
         }
-        noopedChangesByRevisionCheck.inc(changes.size() - trueChanges.size());
+        noopedChangesByRevisionCheck.inc(changes.size() - trueChanges.changes.size());
 
         List<Change> processedChanges;
         try (Context ctx = wikibaseDataFetchTime.time()) {
             List<Future<Change>> futureChanges = new ArrayList<>();
-            for (Change change : trueChanges) {
+            for (Change change : trueChanges.changes) {
                 futureChanges.add(executor.submit(() -> {
                     while (true) {
                         try {
-                            handleChange(change);
+                            handleChange(change, trueChanges.repoValues, trueChanges.repoRefs);
                             return change;
                         } catch (RetryableException e) {
                             log.warn("Retryable error syncing.  Retrying.", e);
@@ -241,13 +248,16 @@ public class Updater<B extends Change.Batch> implements Runnable, Closeable {
             }
         }
 
-        int nbTriples;
-        try (Context ctx = rdfRepositoryImportTime.time()) {
-            nbTriples = rdfRepository.syncFromChanges(processedChanges, verify);
-        }
-        updatesMeter.mark(processedChanges.size());
-        importedChanged.inc(processedChanges.size());
-        importedTriples.inc(nbTriples);
+        importerExecutor.submit(() -> {
+            int nbTriples;
+            try (Context ctx = rdfRepositoryImportTime.time()) {
+                nbTriples = rdfRepository.syncFromChanges(processedChanges, verify);
+            }
+            updatesMeter.mark(processedChanges.size());
+            importedChanged.inc(processedChanges.size());
+            importedTriples.inc(nbTriples);
+            onCompleteListener.run();
+        } );
     }
 
     /**
@@ -256,7 +266,7 @@ public class Updater<B extends Change.Batch> implements Runnable, Closeable {
      * @param changes Collection of incoming changes.
      * @return A set of changes that need to be entered into the repository.
      */
-    private Set<Change> getRevisionUpdates(Iterable<Change> changes) {
+    private ChangesWithValuesAndRefs getRevisionUpdates(Iterable<Change> changes) {
         // List of changes that indeed need update
         Set<Change> trueChanges = new HashSet<>();
         // List of entity URIs that were changed
@@ -283,28 +293,18 @@ public class Updater<B extends Change.Batch> implements Runnable, Closeable {
         log.debug("Filtered batch contains {} changes", trueChanges.size());
 
         if (!trueChanges.isEmpty()) {
-            setValuesAndRefs(
-                    rdfRepository.getValues(changeIds),
-                    rdfRepository.getRefs(changeIds)
-            );
+            ImmutableSetMultimap<String, String> values = rdfRepository.getValues(changeIds);
+            ImmutableSetMultimap<String, String> refs = rdfRepository.getRefs(changeIds);
             if (log.isDebugEnabled()) {
                 synchronized (this) {
-                    log.debug("Fetched {} values", repoValues.size());
-                    log.debug("Fetched {} refs", repoRefs.size());
+                    log.debug("Fetched {} values", values.size());
+                    log.debug("Fetched {} refs", refs.size());
                 }
             }
-        } else {
-            setValuesAndRefs(null, null);
+            return new ChangesWithValuesAndRefs(trueChanges, values, refs);
         }
 
-        return trueChanges;
-    }
-
-    private synchronized void setValuesAndRefs(
-            ImmutableSetMultimap<String, String> values,
-            ImmutableSetMultimap<String, String> refs) {
-        repoValues = values;
-        repoRefs = refs;
+        return new ChangesWithValuesAndRefs(trueChanges, ImmutableSetMultimap.<String, String>builder().build(), ImmutableSetMultimap.<String, String>builder().build());
     }
 
     /**
@@ -348,17 +348,11 @@ public class Updater<B extends Change.Batch> implements Runnable, Closeable {
      * @throws RetryableException if there is a retryable error updating the rdf
      *             store
      */
-    private void handleChange(Change change) throws RetryableException {
+    private void handleChange(Change change, Multimap<String, String> repoValues, Multimap<String,String> repoRefs) throws RetryableException {
         log.debug("Processing data for {}", change);
         Collection<Statement> statements = wikibase.fetchRdfForEntity(change);
         Set<String> values = new HashSet<>();
         Set<String> refs = new HashSet<>();
-        ImmutableSetMultimap<String, String> repoValues;
-        ImmutableSetMultimap<String, String> repoRefs;
-        synchronized (this) {
-            repoValues = this.repoValues;
-            repoRefs = this.repoRefs;
-        }
         Change loadedChange = munger.mungeWithValues(change.entityId(), statements, repoValues, repoRefs, values, refs, change);
         if (!statements.isEmpty() && loadedChange != change) {
             // If we've got no statements, we have no usable loaded data, so no point in checking
@@ -388,5 +382,17 @@ public class Updater<B extends Change.Batch> implements Runnable, Closeable {
     private String meterReport(Meter meter) {
         return String.format(Locale.ROOT, "(%.1f, %.1f, %.1f)", meter.getOneMinuteRate(), meter.getFiveMinuteRate(),
                 meter.getFifteenMinuteRate());
+    }
+
+    public static class ChangesWithValuesAndRefs {
+        private final Set<Change> changes;
+        private final Multimap<String, String> repoValues;
+        private final Multimap<String, String> repoRefs;
+
+        public ChangesWithValuesAndRefs(Set<Change> changes, Multimap<String, String> repoValues, Multimap<String, String> repoRefs) {
+            this.changes = changes;
+            this.repoValues = repoValues;
+            this.repoRefs = repoRefs;
+        }
     }
 }
