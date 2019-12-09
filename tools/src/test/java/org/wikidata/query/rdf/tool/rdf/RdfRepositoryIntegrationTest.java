@@ -16,6 +16,7 @@ import java.math.BigInteger;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
@@ -604,19 +605,15 @@ public class RdfRepositoryIntegrationTest {
     }
 
     /**
-     * Use Munger to create proper cleanup list.
+     * Use RdfRepository utils to create proper cleanup list.
      */
     private List<String> makeCleanupList(String entityId, List<Statement> data) {
-        Set<String> values = new HashSet<>();
-        Set<String> refs = new HashSet<>();
         String entityURI = uris.entityIdToURI(entityId);
-        munger.mungeWithValues(entityId, data,
-                rdfRepository.getValues(singletonList(entityURI)),
-                rdfRepository.getRefs(singletonList(entityURI)),
-                values, refs);
+        Collection<String> existingValues = rdfRepository.getValues(singletonList(entityURI)).get(entityURI);
+        Collection<String> existingRefs = rdfRepository.getRefs(singletonList(entityURI)).get(entityURI);
         List<String> changeList = new ArrayList<>();
-        changeList.addAll(values);
-        changeList.addAll(refs);
+        changeList.addAll(RdfRepository.extractValuesToCleanup(existingValues, data));
+        changeList.addAll(RdfRepository.extractReferencesToCleanup(existingRefs, data));
         return changeList;
     }
 
