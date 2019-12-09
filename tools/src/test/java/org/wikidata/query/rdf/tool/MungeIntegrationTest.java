@@ -56,7 +56,7 @@ public class MungeIntegrationTest {
     @Test
     public void loadTest() throws IOException, ParseException, QueryEvaluationException {
         try {
-            loadDumpIntoRepo("test.ttl", 944, closer);
+            loadDumpIntoRepo("test.ttl", 963, closer);
         } catch (Throwable t) {
             throw closer.rethrow(t);
         } finally {
