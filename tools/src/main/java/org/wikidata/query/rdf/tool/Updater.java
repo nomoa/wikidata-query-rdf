@@ -1,6 +1,7 @@
 package org.wikidata.query.rdf.tool;
 
 import static java.lang.Thread.currentThread;
+import static org.wikidata.query.rdf.tool.rdf.EntityStatementsWithoutRank.entityStatementsWithoutRank;
 
 import java.io.Closeable;
 import java.io.IOException;
@@ -289,6 +290,16 @@ public class Updater<B extends Change.Batch> implements Runnable, Closeable {
     }
 
     private void importToRdfRepository(List<Change> processedChanges, Runnable onCompleteListener) {
+        if (verify) {
+            for (Change change : processedChanges) {
+                Set<String> entityStmtsWithoutRank = change.getStatements()
+                        .stream()
+                        .collect(entityStatementsWithoutRank());
+                if (!entityStmtsWithoutRank.isEmpty()) {
+                    log.warn("Found some statements without ranks while processing {}: {}", change.entityId(), entityStmtsWithoutRank);
+                }
+            }
+        }
         int nbTriples = rdfRepositoryImportTime.time(() -> rdfRepository.syncFromChanges(processedChanges, verify));
         updatesMeter.mark(processedChanges.size());
         importedChanged.inc(processedChanges.size());
